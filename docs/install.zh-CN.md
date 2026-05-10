@@ -58,6 +58,6 @@ TUI 模式默认 `RUST_LOG=codex_core=info,codex_tui=info,codex_rmcp_client=info
 tail -F ~/.codex/log/codex-tui.log
 ```
 
-相比之下，非交互模式（`codex exec`）默认 `RUST_LOG=error`，日志直接内联输出，无需监控单独的文件。
+相比之下，非交互模式（`codex exec`）默认 `RUST_LOG=error`，日志直接打印到终端，和正常输出混在一起，不需要像 TUI 那样另外监控日志文件。
 
 更多配置选项请参阅 Rust 文档中关于 [`RUST_LOG`](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) 的说明。
