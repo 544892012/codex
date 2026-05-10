@@ -3,39 +3,21 @@
 ## 最终方案
 
 ```
-codex exec --json "prompt" > /tmp/codex_output.jsonl 2>/tmp/codex_debug.log
+codex exec --json "prompt" > /tmp/codex_output.jsonl
        │
-       ├─ stdout → JSONL 文件 (结构化事件，逐行落盘)
-       └─ stderr → 日志文件 (RUST_LOG，默认几乎无输出)
+       └─ stdout → JSONL 文件，所有模型输出都在这一条流里
 
-         ↓ 逐行解析 JSONL
+         ↓ 逐行解析这同一个文件
 
 Python 层
-       ├─ 解析 event → 格式化为 ANSI 彩色文本 → WebSocket 推送 (终端视图)
-       └─ 解析 event → 结构化数据提取 (diff 视图、状态卡片)
-
-         ↓ WebSocket
+       ├─ 格式化为 ANSI 彩色文本 → WebSocket 推送 → 前端 xterm.js 渲染
+       └─ 提取结构化数据 → diff 视图、状态卡片等
 
 前端 (浏览器)
-       └─ xterm.js 渲染 ANSI 文本为终端效果
-            ↑ npm 包 @xterm/xterm，通用浏览器终端模拟器，与 codex 零耦合
+       └─ xterm.js (npm 包 @xterm/xterm)，与 codex 零耦合
 ```
 
-**三点说清**：
-1. **JSONL 是数据源** — 大模型每一步输出、命令执行、文件修改都在里面，落盘后反复可读
-2. **Python 是转换器** — JSONL → ANSI 彩色文本，等于重写了一个轻量 `EventProcessorWithHumanOutput`
-3. **xterm.js 是渲染器** — 你喂 ANSI 文本它就画，不自带任何 codex 逻辑
-
----
-
-## 一、stdout/stderr 分工
-
-| 模式 | stdout | stderr |
-|------|--------|--------|
-| `--json` | JSONL 结构化事件流 | RUST_LOG 日志（默认几乎无输出） |
-| 无 `--json` | 仅最终 AI 回复文本 | **完整执行过程**（`EventProcessorWithHumanOutput` 的 `eprintln!` 输出） |
-
-关键澄清：无 `--json` 时 stderr 不是"日志"，是全部格式化的执行过程——turn 开始/结束、命令执行、文件修改、AI 回复都在 stderr。但因为没法提取结构化数据，最终方案选 `--json`。
+**就一个文件**：`--json` 模式下，模型回复、推理过程、命令执行、文件修改全部混在 stdout 这一个 JSONL 流里，逐行解析即可。stderr 默认 empty，可以不管。
 
 ---
 
@@ -94,11 +76,10 @@ async def codex_node(prompt: str, node_id: str, ws):
 
     jsonl_path = f"/tmp/codex_{node_id}.jsonl"
 
-    # 1. 执行 codex，JSONL 落盘
+    # 执行 codex，JSONL 落盘
     proc = await asyncio.create_subprocess_exec(
         "codex", "exec", "--json", prompt,
         stdout=open(jsonl_path, "w"),
-        stderr=open(f"/tmp/codex_{node_id}.log", "w"),
     )
     await proc.wait()
 
