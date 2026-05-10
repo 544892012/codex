@@ -13,15 +13,18 @@
 │   ├── domain-model.md         领域模型、业务概念
 │   ├── architecture.md         架构决策、技术选型
 │   └── coding-conventions.md   编码规范
-├── codebase-index/             ← --add-dir，代码库索引（定时任务自动生成）
+├── codebase-index/             ← --add-dir，代码库导航索引（定时任务自动生成）
 │   └── {project}-index.md
+├── api-registry/               ← --add-dir，API 契约注册表（CI push 触发自动生成）
+│   └── {project}-contracts.json
 └── output/                     ← --add-dir，DAG 产出汇总
     ├── tech-design.md
     └── ...
 ```
 
-- **knowledge**：人工维护，长期沉淀，讲"业务是什么"、"为什么这么设计"
+- **knowledge**：人工维护，讲"业务是什么"、"为什么这么设计"
 - **codebase-index**：定时任务自动生成，讲"代码在哪"、"模块间怎么依赖"
+- **api-registry**：CI push 触发增量更新，讲"接口长什么样"、"被谁调用"
 - **rules**：`.rules` 文件放在工作目录下，codex 自动递归加载，不需要 CLI 传参
 - **output**：DAG 节点产出文件，下游节点通过 `--add-dir` 读取
 
@@ -42,7 +45,110 @@
    需要按模块列出：职责、关键文件路径、对外接口、依赖的模块。"
 ```
 
-## 三、单个 DAG 节点的标准调用
+## 三、API 契约注册表
+
+### 3.1 作用
+
+记录每个服务对外暴露的 API 接口：方法签名、参数类型、调用方、被调用方。帮助 DAG 影响分析节点（Step 1）精确评估"改这个接口会影响哪些地方"。
+
+**与 codebase-index 的分工**：
+
+| | codebase-index | api-registry |
+|------|---------|--------|
+| 回答的问题 | 这个模块代码在哪 | 这个接口被谁调用 |
+| 粒度 | 文件级 | 接口级 |
+| 刷新时机 | 每天定时 | 每次 git push |
+| 格式 | Markdown 文档 | 结构化 JSON |
+
+### 3.2 格式
+
+```json
+{
+  "services": {
+    "order": {
+      "repo": "/data/repos/order-service",
+      "apis": [
+        {
+          "id": "order.CancelOrder",
+          "type": "grpc",
+          "file": "order/internal/handler/cancel.go",
+          "signature": "rpc CancelOrder(CancelOrderReq) returns (CancelOrderResp)",
+          "callers": ["gateway", "scheduler"],
+          "callees": ["payment.Refund", "order.UpdateStatus"],
+          "description": "取消订单并触发退款"
+        }
+      ]
+    },
+    "payment": {
+      "repo": "/data/repos/payment-service",
+      "apis": [
+        {
+          "id": "payment.Refund",
+          "type": "grpc",
+          "file": "payment/handler/refund.go",
+          "signature": "rpc Refund(RefundReq) returns (RefundResp)",
+          "callers": ["order.CancelOrder"],
+          "callees": [],
+          "description": "执行退款操作"
+        }
+      ]
+    }
+  }
+}
+```
+
+`callers` 和 `callees` 是影响分析的核心字段——知道谁调了谁，改一个接口就能反向查找所有受影响方。
+
+### 3.3 生成方式
+
+按代码库是否有统一的接口定义语言来选路径：
+
+**路径 1：有标准契约文件（推荐）**
+
+```
+gRPC (.proto)          → 直接解析 proto 文件
+OpenAPI/Swagger        → 读 openapi.yaml
+GraphQL (.graphql)     → 读 schema 文件
+```
+
+```bash
+codex exec --json --dangerously-bypass-approvals-and-sandbox \
+  -C /data/repos/my-project \
+  "扫描所有 .proto 文件，为每个 service 的每个 rpc 方法输出：
+   方法签名、所属服务、输入/输出类型、一句话业务描述。
+   输出结构化 JSON 到 /data/api-registry/grpc-contracts.json。"
+```
+
+**路径 2：从代码中推断（无统一格式，兜底）**
+
+```bash
+codex exec --json --dangerously-bypass-approvals-and-sandbox \
+  -C /data/repos/my-project \
+  "扫描 order 服务中 handler 层的 HTTP/RPC 处理函数，
+   提取 endpoint、请求/返回结构、调用了哪些下游服务。
+   输出到 /data/api-registry/order-contracts.json。"
+```
+
+路径 2 准确率不如路径 1，但 Step 3 验证节点会跑构建和测试来兜底。
+
+### 3.4 增量刷新
+
+每次 git push 触发，只分析变更文件，不全量扫：
+
+```bash
+# CI 中触发（.github/workflows/api-registry.yml）
+CHANGED_FILES=$(git diff --name-only HEAD~1)
+
+codex exec --json --dangerously-bypass-approvals-and-sandbox \
+  -C /data/repos/my-project \
+  "以下文件发生了变更：$CHANGED_FILES。
+   只检查和更新这些文件涉及到的 API 契约，
+   增量更新 /data/api-registry/contracts.json。"
+```
+
+---
+
+## 四、单个 DAG 节点的标准调用
 
 ```bash
 codex exec \
@@ -51,14 +157,14 @@ codex exec \
   -C /data/repos/my-project \
   --add-dir /data/knowledge \
   --add-dir /data/codebase-index \
+  --add-dir /data/api-registry \
   --add-dir /data/output \
-  --output-last-message /data/output/last-message.txt \
   "prompt"
 ```
 
 参数固定，只有 prompt 因节点不同而变化。以下是每个参数的说明。
 
-## 四、参数速查
+## 五、参数速查
 
 ### 核心
 
@@ -110,7 +216,7 @@ codex exec \
 | `--ignore-user-config` | 不加载 `~/.codex/config.toml` |
 | `--ignore-rules` | 禁止加载 `.rules` 文件 |
 
-## 五、Rules
+## 六、Rules
 
 Rules 是 execpolicy DSL 格式的执行策略文件，控制 codex 可以执行哪些命令、不能执行哪些。
 
@@ -124,7 +230,7 @@ deny: rm -rf
 deny: git push --force
 ```
 
-## 六、Knowledge
+## 七、Knowledge
 
 **加载方式**：通过 `--add-dir` 挂载。AI 在 turn 中自己 `cat` / `rg` 查阅。
 
@@ -133,7 +239,7 @@ deny: git push --force
 - `architecture.md` — 系统架构、技术选型理由、关键决策记录
 - `coding-conventions.md` — 命名规范、目录结构约定、代码风格
 
-## 七、Skills
+## 八、Skills
 
 **加载方式**：通过 `config.toml` + 文件系统，不是 CLI 参数。
 
@@ -163,17 +269,17 @@ codex exec --profile design "设计订单模块 API"     # 设计节点
 codex exec --profile implement "实现订单模块 API"  # 编码节点
 ```
 
-## 八、不同节点类型的调用差异
+## 九、不同节点类型的调用差异
 
 ```bash
-# 需求分析/文档编写：读为主，不写代码
+# 需求分析/影响范围分析：读为主，不写代码
 codex exec --json --dangerously-bypass-approvals-and-sandbox \
   -C /data/repos/my-project \
   --add-dir /data/knowledge \
   --add-dir /data/codebase-index \
-  -o /data/output/last-message.txt \
+  --add-dir /data/api-registry \
   --profile design \
-  "分析需求，编写技术方案文档"
+  "分析需求影响范围，输出结构化改动清单"
 
 # 编码实现：写代码，-C 指到真实代码库
 codex exec --json --dangerously-bypass-approvals-and-sandbox \
@@ -190,7 +296,7 @@ codex exec --json --dangerously-bypass-approvals-and-sandbox \
   "运行测试套件，修复失败的测试"
 ```
 
-## 九、环境变量
+## 十、环境变量
 
 | 变量 | 说明 |
 |------|------|
@@ -198,7 +304,7 @@ codex exec --json --dangerously-bypass-approvals-and-sandbox \
 | `TRACEPARENT` | W3C trace context，挂到外部 trace 系统 |
 | `CODEX_HOME` | codex 配置/状态/缓存的根目录 |
 
-## 十、与其他文档的关系
+## 十一、与其他文档的关系
 
 | 文档 | 内容 |
 |------|------|
