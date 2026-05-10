@@ -1,5 +1,42 @@
 # codex exec 输出在 Web 管理台的渲染方案
 
+## 最终方案
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  codex exec --json "prompt"                                     │
+│       │                                                         │
+│       ├─ stdout → JSONL 文件 (结构化事件流)                       │
+│       │            逐行落盘，便于事后复盘和审计                      │
+│       │                                                         │
+│       └─ stderr → 日志文件 (RUST_LOG，默认几乎无输出)              │
+│                                                                 │
+│         ↓ 逐行解析 JSONL                                         │
+│                                                                 │
+│  Python 层                                                       │
+│       ├─ 解析每个 JSONL event                                    │
+│       ├─ 按 item type 路由 → 格式化为 ANSI 彩色文本                │
+│       └─ WebSocket 推送                                          │
+│                                                                 │
+│         ↓ WebSocket                                              │
+│                                                                 │
+│  前端 (浏览器)                                                    │
+│       └─ xterm.js 渲染 ANSI 文本为终端效果                         │
+│            ↑                                                    │
+│            └── 通用浏览器终端模拟器，与 codex 项目零耦合             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**核心要点**：
+
+1. **JSONL 文件是数据源** — `codex exec --json` 的输出直接落盘，Python 层逐行解析。每一步大模型输出（agent_message、reasoning）、命令执行、文件修改都以结构化 JSON 形式存在 JSONL 中。
+2. **Python 层是格式转换器** — 将 JSONL 事件转为带 ANSI 转义码的彩色文本，这一步是在重新实现一个轻量版的 `EventProcessorWithHumanOutput`。
+3. **xterm.js 是纯渲染器** — 它不感知 codex，不消费 JSONL，它是一个独立的浏览器终端模拟器库（npm 包 `@xterm/xterm`），你喂 ANSI 文本它就渲染。和 codex 项目（ratatui TUI）没有任何代码关系。
+
+---
+
 ## 一、数据来源：stdout 与 stderr 的分工
 
 ### 1.1 --json 模式（推荐）
@@ -96,16 +133,14 @@ ws.onmessage = (e) => term.write(e.data);
 - 输出是纯文本，无法提取结构化数据做 diff 视图、状态卡片
 - md/修改的文件/搜索结果等，无法获取数据做额外展示，只能展示执行过程
 
-### 方案 B：--json 事件 → ANSI 格式化 → xterm.js（推荐，最终方案）
+### 方案 B：--json 落盘 → 逐行解析 → ANSI 格式化 → xterm.js（最终方案）
 
-用 `--json` 拿到结构化事件，在 Python 层转成带 ANSI 颜色的终端文本，前端仍用 xterm.js 渲染。
+```bash
+# 执行，stdout 落盘为 JSONL 文件，stderr 落盘为日志
+codex exec --json "prompt" > /tmp/codex_output.jsonl 2>/tmp/codex_debug.log
+```
 
-```
-codex exec --json "prompt"
-  → stdout: JSONL 结构化事件
-  → Python: 逐行解析 → 转 ANSI 彩色文本
-  → WebSocket → 前端 xterm.js 渲染
-```
+Python 层逐行解析 JSONL，将结构化事件转为 ANSI 彩色文本：
 
 ```python
 def format_event_for_terminal(event: dict) -> str:
@@ -159,10 +194,48 @@ def _format_item(item: dict, completed: bool) -> str:
     return ""
 ```
 
+将上述格式化逻辑接入 LangGraph 节点和 WebSocket 推送：
+
+```python
+import asyncio
+import json
+
+async def stream_jsonl_to_frontend(jsonl_path: str, ws):
+    """逐行解析 JSONL 文件，格式化为 ANSI 文本，推送到前端 xterm.js"""
+    with open(jsonl_path) as f:
+        for line in f:
+            event = json.loads(line)
+            ansi_text = format_event_for_terminal(event)
+            if ansi_text:
+                await ws.send_text(ansi_text)
+
+# LangGraph 节点中使用
+async def codex_node(prompt: str, ws):
+    """在 DAG 节点中调用 codex exec，输出 JSONL + 实时推前端"""
+
+    # 执行 codex exec，JSONL 落盘
+    proc = await asyncio.create_subprocess_exec(
+        "codex", "exec", "--json", prompt,
+        stdout=open(f"/tmp/codex_{node_id}.jsonl", "w"),
+        stderr=open(f"/tmp/codex_{node_id}.log", "w"),
+    )
+    await proc.wait()
+
+    # 逐行解析 JSONL → 推前端 xterm.js
+    await stream_jsonl_to_frontend(f"/tmp/codex_{node_id}.jsonl", ws)
+
+    # 同时可以解析结构化数据，用于 diff 视图、状态卡片等
+    items = parse_jsonl_items(f"/tmp/codex_{node_id}.jsonl")
+    return items
+```
+
 **优点**：
 - stdout = 数据通道，stderr = 日志通道，完美分离
-- 结构化数据可同时用于 diff 视图、状态卡片（第 5 节的组件方案）
+- JSONL 落盘后可以反复读取，无需重新执行 codex exec，便于审计和调试
+- 结构化数据可同时用于 diff 视图、状态卡片（第 7 节的组件方案）
+- 最终 AI 回复直接从最后一个 `agent_message` item 中提取，无需额外 `-o` 参数
 - ANSI 颜色完全可控
+- 前端 xterm.js 与 codex 项目零耦合
 
 **缺点**：需要在 Python 侧写格式化逻辑。
 
