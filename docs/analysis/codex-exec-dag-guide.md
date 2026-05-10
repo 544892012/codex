@@ -4,15 +4,17 @@
 
 ```
 /data
-├── repos/{project}/           ← -C 指向的工作目录
+├── repos/{project}/           ← -C 指向的工作目录。全量 git clone，所有代码文件在此。
+│   │                             codex 在此读写文件、运行命令、探索代码。
+│   ├── .rules                  执行规则（自动加载，控制允许/禁止哪些命令）
+│   ├── .codex/skills/          项目级 skills
+│   └── src/ ...                你的代码
 ├── knowledge/                  ← --add-dir，业务知识库（人工维护）
 │   ├── domain-model.md         领域模型、业务概念
 │   ├── architecture.md         架构决策、技术选型
 │   └── coding-conventions.md   编码规范
 ├── codebase-index/             ← --add-dir，代码库索引（定时任务自动生成）
 │   └── {project}-index.md
-├── rules/                      ← 执行规则（符号链接到工作目录或全局 CODEX_HOME）
-│   └── {project}.rules
 └── output/                     ← --add-dir，DAG 产出汇总
     ├── tech-design.md
     └── ...
